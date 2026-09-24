@@ -6,9 +6,14 @@ GUI для измерения спектров на Bruker IFS 125-HR (чере�
 Keithley-функции интегрированы из scontel_gui.py:
   - потокобезопасный доступ (lock)
   - фоновый опрос V/I/статуса
-  - отдельное окно настроек
+  - отдельное компактное окно настроек
   - индикатор compliance (COMPL V / COMPL I)
   - корректное переключение source/measure
+  - измерение и сохранение ВАХ (режим 4 и кнопка в окне Keithley)
+
+Начальное значение compliance: 40e-6
+  → при источнике напряжения = 40 µA
+  → при источнике тока       = 40 µV
 
 Зависимости:
     pip install brukeropus pyserial numpy matplotlib psutil
@@ -41,6 +46,7 @@ except ImportError:
 
 
 K_POLL_INTERVAL_S = 0.5
+DEFAULT_COMPLIANCE = 40e-6   # 40 µA / 40 µV
 
 
 # ============================================================
@@ -423,7 +429,7 @@ class SMC100Motion(MotionController):
 
 
 # ============================================================
-#  Keithley 2400 — потокобезопасная версия из scontel_gui
+#  Keithley 2400
 # ============================================================
 
 class Keithley2400:
@@ -439,7 +445,6 @@ class Keithley2400:
         if not self.ser.is_open:
             raise ConnectionError(f"Не удалось открыть порт {port}")
 
-        # ВАЖНО: lock создаётся до первого обращения к query()/write()
         self._io_lock = threading.Lock()
 
         self._source_mode = 'VOLT'
@@ -459,13 +464,11 @@ class Keithley2400:
             pass
 
     def write(self, cmd):
-        """Потокобезопасная отправка без ожидания ответа."""
         with self._io_lock:
             self.ser.write((cmd + '\n').encode())
             self.ser.flush()
 
     def query(self, cmd):
-        """Потокобезопасный запрос одной строки ответа."""
         with self._io_lock:
             self.ser.write((cmd + '\n').encode())
             self.ser.flush()
@@ -478,7 +481,8 @@ class Keithley2400:
         self.write(':SOUR:VOLT:MODE FIXED')
         self.write(':SOUR:VOLT:LEV 0')
         self.write(':SENS:FUNC "CURR"')
-        self.write(':SENS:CURR:PROT 0.1')
+        # Начальный compliance: 40 µA
+        self.write(f':SENS:CURR:PROT {DEFAULT_COMPLIANCE}')
         self.write(':OUTP OFF')
         self._source_mode = 'VOLT'
         self._measure_mode = 'CURR'
@@ -539,12 +543,20 @@ class Keithley2400:
                 pass
         return 0.0, '?'
 
+    def read_v_and_i(self):
+        resp = self.query(':READ?')
+        parts = [p.strip() for p in resp.split(',')]
+        if len(parts) >= 2:
+            try:
+                v = float(parts[0])
+                i = float(parts[1])
+                self._has_data = True
+                return v, i
+            except ValueError:
+                pass
+        return None, None
+
     def read_last(self):
-        """
-        Фоновый опрос: триггерит новое измерение через :READ?,
-        чтобы обновлялись и программа, и передняя панель Keithley.
-        Возвращает (V, I) или (None, None), если выход выключен.
-        """
         if not self._output_on:
             return None, None
         result = (None, None)
@@ -566,7 +578,6 @@ class Keithley2400:
         return result
 
     def get_compliance_status(self):
-        """Возвращает 'OK', 'COMPL V', 'COMPL I' или 'COMPL V + I'."""
         try:
             resp = self.query(':STAT:MEAS:COND?')
             st = int(float(resp))
@@ -843,28 +854,31 @@ class OPUSRecovery:
 
 
 # ============================================================
-#  Окно настроек Keithley (аналог scontel_gui)
+#  Окно настроек Keithley — компактное, все параметры внутри
 # ============================================================
 
 class KeithleyWindow(tk.Toplevel):
     def __init__(self, master):
         super().__init__(master)
         self.app = master
-        self.title("Keithley 2400 — настройки")
-        self.geometry("560x560")
+        self.title("Keithley 2400")
+        self.geometry("500x620")
+        self.resizable(False, False)
         self.protocol("WM_DELETE_WINDOW", self.withdraw)
         self.withdraw()
         self._build_ui()
 
     def _build_ui(self):
         app = self.app
+        pad = {"padx": 8, "pady": 4}
 
-        conn = ttk.LabelFrame(self, text="Подключение", padding=8)
-        conn.pack(fill="x", padx=8, pady=6)
+        # ---------- Подключение ----------
+        conn = ttk.LabelFrame(self, text="Подключение", padding=6)
+        conn.pack(fill="x", **pad)
         ttk.Label(conn, text="COM:").pack(side="left")
         self.combo = ttk.Combobox(conn, textvariable=app.keithley_port,
                                   width=10)
-        self.combo.pack(side="left", padx=5)
+        self.combo.pack(side="left", padx=4)
         self.combo.bind("<Button-1>",
                         lambda e: app.refresh_keithley_ports())
         ttk.Button(conn, text="Подключить",
@@ -872,65 +886,106 @@ class KeithleyWindow(tk.Toplevel):
         ttk.Button(conn, text="Отключить",
                    command=app.disconnect_keithley).pack(side="left", padx=3)
 
-        info = ttk.LabelFrame(self, text="Текущие измерения", padding=8)
-        info.pack(fill="x", padx=8, pady=6)
+        # ---------- Текущие измерения ----------
+        info = ttk.LabelFrame(self, text="Измерения", padding=6)
+        info.pack(fill="x", **pad)
 
-        ttk.Label(info, text="Напряжение:").grid(row=0, column=0,
-                                                 sticky="w", pady=2)
+        ttk.Label(info, text="U:").grid(row=0, column=0, sticky="w")
         ttk.Label(info, textvariable=app.keithley_v_var,
                   font=("TkDefaultFont", 11, "bold"),
-                  foreground="blue").grid(row=0, column=1,
-                                          sticky="w", padx=10)
+                  foreground="blue").grid(row=0, column=1, sticky="w", padx=10)
 
-        ttk.Label(info, text="Ток:").grid(row=1, column=0,
-                                          sticky="w", pady=2)
+        ttk.Label(info, text="I:").grid(row=1, column=0, sticky="w")
         ttk.Label(info, textvariable=app.keithley_i_var,
                   font=("TkDefaultFont", 11, "bold"),
-                  foreground="blue").grid(row=1, column=1,
-                                          sticky="w", padx=10)
+                  foreground="blue").grid(row=1, column=1, sticky="w", padx=10)
 
-        ttk.Label(info, text="Статус:").grid(row=2, column=0,
-                                             sticky="w", pady=2)
+        ttk.Label(info, text="Статус:").grid(row=2, column=0, sticky="w")
         app.keithley_status_label = ttk.Label(
             info, textvariable=app.keithley_status_var,
             font=("TkDefaultFont", 11, "bold"), foreground="green")
-        app.keithley_status_label.grid(row=2, column=1,
-                                       sticky="w", padx=10)
+        app.keithley_status_label.grid(row=2, column=1, sticky="w", padx=10)
 
-        src = ttk.LabelFrame(self, text="Источник", padding=8)
-        src.pack(fill="x", padx=8, pady=6)
-        ttk.Radiobutton(src, text="Напряжение (В)",
+        # ---------- Источник ----------
+        src = ttk.LabelFrame(self, text="Источник", padding=6)
+        src.pack(fill="x", **pad)
+
+        row = ttk.Frame(src)
+        row.pack(fill="x")
+        ttk.Radiobutton(row, text="Напряжение, В",
                         variable=app.keithley_source_mode,
                         value="VOLT",
-                        command=app._update_compliance_label).grid(
-            row=0, column=0, sticky="w")
-        ttk.Radiobutton(src, text="Ток (А)",
+                        command=app._update_compliance_label).pack(side="left")
+        ttk.Radiobutton(row, text="Ток, А",
                         variable=app.keithley_source_mode,
                         value="CURR",
-                        command=app._update_compliance_label).grid(
-            row=0, column=1, sticky="w", padx=10)
-        ttk.Label(src, text="Уровень:").grid(row=1, column=0,
-                                             sticky="w", pady=4)
-        ttk.Entry(src, textvariable=app.keithley_level,
-                  width=12).grid(row=1, column=1, sticky="w", padx=5)
+                        command=app._update_compliance_label).pack(
+            side="left", padx=(10, 0))
 
-        app.compliance_label = ttk.Label(src, text="Предел по току, А:")
-        app.compliance_label.grid(row=2, column=0, sticky="w", pady=4)
-        ttk.Entry(src, textvariable=app.keithley_compliance,
-                  width=12).grid(row=2, column=1, sticky="w", padx=5)
+        row = ttk.Frame(src)
+        row.pack(fill="x", pady=(4, 0))
+        ttk.Label(row, text="Уровень:").pack(side="left")
+        ttk.Entry(row, textvariable=app.keithley_level,
+                  width=12).pack(side="left", padx=4)
 
-        ttk.Checkbutton(src, text="Выход включён",
+        row = ttk.Frame(src)
+        row.pack(fill="x", pady=(4, 0))
+        app.compliance_label = ttk.Label(row, text="Предел по току, А:")
+        app.compliance_label.pack(side="left")
+        ttk.Entry(row, textvariable=app.keithley_compliance,
+                  width=12).pack(side="left", padx=4)
+
+        row = ttk.Frame(src)
+        row.pack(fill="x", pady=(4, 0))
+        ttk.Checkbutton(row, text="Выход включён",
                         variable=app.keithley_output_on,
-                        command=app._keithley_toggle_output).grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=4)
+                        command=app._keithley_toggle_output).pack(side="left")
 
         app._update_compliance_label()
 
+        # ---------- Свип ----------
+        sw = ttk.LabelFrame(self, text="Свип / ВАХ", padding=6)
+        sw.pack(fill="x", **pad)
+
+        ttk.Checkbutton(sw, text="Фиксированный уровень (без свипа)",
+                        variable=app.keithley_measure_fixed).pack(anchor="w")
+        ttk.Checkbutton(sw, text="Свип туда-обратно",
+                        variable=app.keithley_bidirectional_var).pack(
+            anchor="w", pady=(2, 4))
+
+        row = ttk.Frame(sw)
+        row.pack(fill="x")
+        ttk.Label(row, text="От:").pack(side="left")
+        ttk.Entry(row, textvariable=app.keithley_sweep_start,
+                  width=10).pack(side="left", padx=(2, 8))
+        ttk.Label(row, text="До:").pack(side="left")
+        ttk.Entry(row, textvariable=app.keithley_sweep_end,
+                  width=10).pack(side="left", padx=(2, 0))
+
+        row = ttk.Frame(sw)
+        row.pack(fill="x", pady=(4, 0))
+        ttk.Label(row, text="Шаг:").pack(side="left")
+        ttk.Entry(row, textvariable=app.keithley_sweep_step,
+                  width=10).pack(side="left", padx=(2, 8))
+        ttk.Label(row, text="Задержка, с:").pack(side="left")
+        ttk.Entry(row, textvariable=app.keithley_sweep_delay,
+                  width=6).pack(side="left", padx=(2, 0))
+
+        hint = ttk.Label(sw, foreground="gray",
+                         text="ВАХ сохраняется в папку эксперимента\n"
+                              "как VAH_<дата>_<время>.txt + _info.txt",
+                         justify="left", font=("TkDefaultFont", 8, "italic"))
+        hint.pack(anchor="w", pady=(6, 0))
+
+        # ---------- Кнопки ----------
         btn = ttk.Frame(self)
-        btn.pack(fill="x", padx=8, pady=8)
+        btn.pack(fill="x", **pad)
         ttk.Button(btn, text="Применить настройки",
                    command=app._keithley_apply_settings).pack(
-            side="left", padx=4)
+            side="left", expand=True, fill="x", padx=2)
+        ttk.Button(btn, text="Измерить ВАХ",
+                   command=app.run_keithley_measurement).pack(
+            side="left", expand=True, fill="x", padx=2)
 
 
 # ============================================================
@@ -988,14 +1043,17 @@ class Application(tk.Tk):
         self.step_um = tk.DoubleVar(value=10.0)
         self.map_update_every = tk.IntVar(value=3)
 
-        # --- Keithley (как в scontel_gui) ---
+        # --- Keithley (все настройки в одном месте) ---
         self.keithley_source_mode = tk.StringVar(value="VOLT")
         self.keithley_level = tk.DoubleVar(value=0.0)
-        self.keithley_compliance = tk.DoubleVar(value=0.1)
+        # Начальный compliance 40 µA / 40 µV
+        self.keithley_compliance = tk.DoubleVar(value=DEFAULT_COMPLIANCE)
         self.keithley_measure_fixed = tk.BooleanVar(value=True)
         self.keithley_sweep_start = tk.DoubleVar(value=0.0)
         self.keithley_sweep_end = tk.DoubleVar(value=10.0)
         self.keithley_sweep_step = tk.DoubleVar(value=1.0)
+        self.keithley_sweep_delay = tk.DoubleVar(value=0.2)
+        self.keithley_bidirectional_var = tk.BooleanVar(value=False)
         self.keithley_output_on = tk.BooleanVar(value=False)
 
         # Живая индикация V/I/статуса
@@ -1121,7 +1179,6 @@ class Application(tk.Tk):
                   foreground="gray",
                   font=("TkDefaultFont", 7, "italic")).pack(side="left")
 
-        # Keithley строка
         row_k = ttk.Frame(conn_frame)
         row_k.pack(fill="x", pady=1)
         ttk.Label(row_k, text="COM Keithley:").pack(side="left")
@@ -1144,7 +1201,6 @@ class Application(tk.Tk):
                                  font=("TkDefaultFont", 9, "bold"))
         self.k_label.pack(side="left", padx=5)
 
-        # OPUS
         row2 = ttk.Frame(conn_frame)
         row2.pack(fill="x", pady=1)
         ttk.Label(row2, text="OPUS:").pack(side="left")
@@ -1244,15 +1300,22 @@ class Application(tk.Tk):
                         text="3 – Спектры при разных токах/напряжениях (Keithley)",
                         value=3, variable=self.mode_var,
                         command=self.update_mode).pack(anchor="w")
+        ttk.Radiobutton(mode_frame,
+                        text="4 – Измерение ВАХ (Keithley, без OPUS)",
+                        value=4, variable=self.mode_var,
+                        command=self.update_mode).pack(anchor="w")
 
         # ============ ИСПОЛЬЗОВАНИЕ KEITHLEY ============
         k_frame = ttk.LabelFrame(left_frame, text="Keithley 2400", padding=6)
         k_frame.pack(fill="x", pady=3)
         ttk.Checkbutton(k_frame,
-                        text="Использовать Keithley в измерениях",
+                        text="Использовать Keithley в измерениях спектров",
                         variable=self.use_keithley_var,
                         command=self.on_use_keithley_toggle).pack(anchor="w")
-        self.k_detail_frame = ttk.Frame(k_frame)
+        ttk.Label(k_frame,
+                  text="Все настройки Keithley — в отдельном окне.",
+                  foreground="gray",
+                  font=("TkDefaultFont", 8, "italic")).pack(anchor="w", pady=(4, 0))
 
         # ============ УПРАВЛЕНИЕ ПОДВИЖКОЙ ============
         motion_frame = ttk.LabelFrame(left_frame,
@@ -1324,7 +1387,7 @@ class Application(tk.Tk):
         self.right_paned.pack(fill="both", expand=True)
 
         top_frame = ttk.LabelFrame(self.right_paned,
-                                   text="Текущий спектр", padding=5)
+                                   text="Текущий график", padding=5)
         self.right_paned.add(top_frame, weight=1)
 
         self.fig_spectrum = Figure(figsize=(6, 3), dpi=100,
@@ -1492,10 +1555,9 @@ class Application(tk.Tk):
             self.motion = None
 
     # ------------------------------------------------------------
-    #  Keithley: подключение / окно / настройки / polling
+    #  Keithley
     # ------------------------------------------------------------
     def on_use_keithley_toggle(self):
-        self._build_keithley_details()
         if self.use_keithley_var.get():
             self.toggle_keithley_window()
         else:
@@ -1518,6 +1580,14 @@ class Application(tk.Tk):
         try:
             self.keithley = Keithley2400(
                 port, log_func=lambda m: self.data_queue.put(("log", m)))
+            # Применить текущий compliance (40 µA / 40 µV)
+            try:
+                self.keithley.set_source_function(
+                    self.keithley_source_mode.get())
+                self.keithley.set_compliance(
+                    float(self.keithley_compliance.get()))
+            except Exception:
+                pass
             self.keithley_status.set("Подключено")
             self.k_label.config(foreground="green")
             self.set_indicator("keithley", "green")
@@ -1570,7 +1640,6 @@ class Application(tk.Tk):
         self._k_poll_thread = None
 
     def _poll_k_loop(self):
-        """Фоновый опрос Keithley в отдельном потоке."""
         while not self._k_poll_stop.is_set():
             if self.keithley is None:
                 break
@@ -1604,7 +1673,8 @@ class Application(tk.Tk):
             self.keithley.set_source_function(mode)
             self.keithley.set_source_level(self.keithley_level.get())
             self.keithley.set_compliance(self.keithley_compliance.get())
-            self.log("Настройки Keithley применены")
+            self.log(f"Настройки Keithley применены "
+                     f"(compliance={self.keithley_compliance.get():.3e})")
         except Exception as e:
             messagebox.showerror("Keithley", f"Ошибка: {e}")
 
@@ -1627,46 +1697,7 @@ class Application(tk.Tk):
         except Exception as e:
             self.log(f"Keithley: ошибка управления выходом: {e}")
 
-    def _build_keithley_details(self):
-        if not self.use_keithley_var.get():
-            try:
-                self.k_detail_frame.pack_forget()
-            except Exception:
-                pass
-            return
-        if not self.k_detail_frame.winfo_ismapped():
-            self.k_detail_frame.pack(fill="x", pady=(3, 0))
-        for w in self.k_detail_frame.winfo_children():
-            w.destroy()
-
-        row = ttk.Frame(self.k_detail_frame)
-        row.pack(fill="x", pady=1)
-        ttk.Label(row, text="Источник:").pack(side="left")
-        ttk.Radiobutton(row, text="Ток (мА)", value="current",
-                        variable=self.keithley_mode_var).pack(side="left", padx=3)
-        ttk.Radiobutton(row, text="Напряжение (В)", value="voltage",
-                        variable=self.keithley_mode_var).pack(side="left", padx=3)
-
-        row = ttk.Frame(self.k_detail_frame)
-        row.pack(fill="x", pady=1)
-        ttk.Label(row, text="Старт:").pack(side="left")
-        ttk.Entry(row, textvariable=self.k_start, width=6).pack(side="left", padx=2)
-        ttk.Label(row, text="Конец:").pack(side="left", padx=(4, 0))
-        ttk.Entry(row, textvariable=self.k_end, width=6).pack(side="left", padx=2)
-        ttk.Label(row, text="Шаг:").pack(side="left", padx=(4, 0))
-        ttk.Entry(row, textvariable=self.k_step, width=6).pack(side="left", padx=2)
-
-        row = ttk.Frame(self.k_detail_frame)
-        row.pack(fill="x", pady=1)
-        ttk.Label(row, text="U-предел (В):").pack(side="left")
-        ttk.Entry(row, textvariable=self.k_voltage_compliance,
-                  width=6).pack(side="left", padx=2)
-        ttk.Label(row, text="I-предел (мА):").pack(side="left", padx=(6, 0))
-        ttk.Entry(row, textvariable=self.k_current_compliance,
-                  width=6).pack(side="left", padx=2)
-
     def _get_keithley_values(self):
-        """Возвращает список (mode, value) для текущего режима Keithley."""
         mode = self.keithley_source_mode.get()
         if self.keithley_measure_fixed.get():
             return [(mode, self.keithley_level.get())]
@@ -1681,6 +1712,148 @@ class Application(tk.Tk):
         else:
             values = [start - i * step for i in range(n)]
         return [(mode, v) for v in values]
+
+    # ------------------------------------------------------------
+    #  ВАХ: измерение и сохранение
+    # ------------------------------------------------------------
+    def _write_vah_info(self, path, mode, compliance,
+                        start, end, step, n_points, bidirectional):
+        try:
+            lines = [
+                "VAH info",
+                "=" * 40,
+                f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"Source mode: {mode}",
+                f"Source unit: {'V' if mode == 'VOLT' else 'A'}",
+                f"Compliance: {compliance} "
+                f"{'A' if mode == 'VOLT' else 'V'}",
+                f"Start: {start}",
+                f"End: {end}",
+                f"Step: {step}",
+                f"Points (including return if bidirectional): {n_points}",
+                f"Bidirectional: {bidirectional}",
+            ]
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception as e:
+            self.data_queue.put(("log", f"VAH info.txt: {e}"))
+
+    def run_keithley_measurement(self):
+        if self.keithley is None:
+            self.data_queue.put(("error", "Keithley 2400 не подключён"))
+            return
+        threading.Thread(target=self._run_vah_thread, daemon=True).start()
+
+    def _run_vah_thread(self):
+        folder = self.folder_path.get()
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except Exception as e:
+            self.data_queue.put(("error", f"Не создать папку: {e}"))
+            return
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        data_path = os.path.join(folder, f"VAH_{ts}.txt")
+        info_path = os.path.join(folder, f"VAH_{ts}_info.txt")
+
+        mode = self.keithley_source_mode.get()
+        unit_src = 'V' if mode == 'VOLT' else 'A'
+        unit_meas = 'A' if mode == 'VOLT' else 'V'
+        compliance = self.keithley_compliance.get()
+        bidirectional = bool(self.keithley_bidirectional_var.get())
+
+        try:
+            self.keithley.set_source_function(mode)
+            self.keithley.set_compliance(compliance)
+        except Exception as e:
+            self.data_queue.put(("error", f"Keithley (настройка): {e}"))
+            return
+
+        # --- фиксированный уровень ---
+        if self.keithley_measure_fixed.get():
+            level = self.keithley_level.get()
+            try:
+                self.keithley.set_source_level(level)
+                self.keithley.output_on()
+                time.sleep(0.5)
+                v, i = self.keithley.read_v_and_i()
+                if v is None or i is None:
+                    v, i = 0.0, 0.0
+                self.data_queue.put(("log",
+                    f"Keithley: {level:.6g} {unit_src} -> "
+                    f"V={v:.6g}, I={i:.6g}"))
+                self.data_queue.put(("plot_keithley",
+                                     ([level],
+                                      [v if mode == 'VOLT' else i],
+                                      f"{level:.4g} {unit_src} (фиксир.)")))
+                self.keithley.output_off()
+                with open(data_path, "w", encoding="utf-8") as f:
+                    f.write("# V\tI\n")
+                    f.write(f"{v:.8e}\t{i:.8e}\n")
+                self._write_vah_info(info_path, mode, compliance,
+                                     level, level, 0.0, 1, bidirectional)
+                self.data_queue.put(("log", f"ВАХ сохранена: {data_path}"))
+            except Exception as e:
+                self.data_queue.put(("error", f"Keithley: {e}"))
+            return
+
+        # --- свип ---
+        start = self.keithley_sweep_start.get()
+        end = self.keithley_sweep_end.get()
+        step = self.keithley_sweep_step.get()
+        delay = self.keithley_sweep_delay.get()
+
+        if step == 0:
+            self.data_queue.put(("error", "Шаг свипа = 0"))
+            return
+
+        n = int(math.ceil(abs(end - start) / abs(step))) + 1
+        forward = [start + i * step if end >= start else start - i * step
+                   for i in range(n)]
+        if bidirectional:
+            sequence = forward + list(reversed(forward[:-1]))
+        else:
+            sequence = forward
+
+        total = len(sequence)
+        self.data_queue.put(("log",
+            f"ВАХ: свип {start:.4g} → {end:.4g} {unit_src}, "
+            f"{total} точек, compliance {compliance} {unit_meas}"))
+        self.data_queue.put(("progress", (0, total)))
+
+        xs, ys = [], []
+        try:
+            self.keithley.set_source_level(sequence[0])
+            self.keithley.output_on()
+            time.sleep(0.2)
+            with open(data_path, "w", encoding="utf-8") as f:
+                f.write("# V\tI\n")
+                for idx, x in enumerate(sequence, start=1):
+                    if self.stop_requested:
+                        self.data_queue.put(("log", "ВАХ остановлена"))
+                        break
+                    self.keithley.set_source_level(x)
+                    time.sleep(delay)
+                    v, i = self.keithley.read_v_and_i()
+                    if v is None or i is None:
+                        v, i = 0.0, 0.0
+                    xs.append(x)
+                    ys.append(v if mode == 'VOLT' else i)
+                    f.write(f"{v:.8e}\t{i:.8e}\n")
+                    f.flush()
+                    self.data_queue.put(("plot_keithley",
+                                         (xs.copy(), ys.copy(), "")))
+                    self.data_queue.put(("progress", (idx, total)))
+            self.keithley.output_off()
+            self._write_vah_info(info_path, mode, compliance,
+                                 start, end, step, total, bidirectional)
+            self.data_queue.put(("log", f"ВАХ сохранена: {data_path}"))
+        except Exception as e:
+            self.data_queue.put(("error", f"Keithley (свип): {e}"))
+            try:
+                self.keithley.output_off()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------
     def connect_opus(self):
@@ -1711,7 +1884,6 @@ class Application(tk.Tk):
         threading.Thread(target=self._check_devices, daemon=True).start()
 
     def _check_devices(self):
-        # Keithley
         try:
             if self.keithley is not None:
                 idn = self.keithley.query('*IDN?')
@@ -1726,7 +1898,6 @@ class Application(tk.Tk):
             self.data_queue.put(("indicator", ("keithley", "red")))
             self.data_queue.put(("log", f"Keithley: {e}"))
 
-        # OPUS
         try:
             if self.opus is None:
                 self.opus = BrukerOPUS(log_func=self.log)
@@ -1738,7 +1909,6 @@ class Application(tk.Tk):
             self.data_queue.put(("indicator", ("opus", "red")))
             self.data_queue.put(("log", f"OPUS: {e}"))
 
-        # Подвижка
         if self.motion is not None:
             self.data_queue.put(("indicator", ("motion", "green")))
         else:
@@ -1825,6 +1995,9 @@ class Application(tk.Tk):
                 elif msg[0] == "spectrum":
                     wn, intensity, pos = msg[1]
                     self.plot_spectrum(wn, intensity, pos)
+                elif msg[0] == "plot_keithley":
+                    x, y, title = msg[1]
+                    self._plot_keithley(x, y, title)
                 elif msg[0] == "3d_update":
                     self._rebuild_and_draw_3d()
                 elif msg[0] == "finish":
@@ -1870,8 +2043,6 @@ class Application(tk.Tk):
         else:
             self.esp_options_frame.pack_forget()
 
-        self._build_keithley_details()
-
         for w in self.param_frame.winfo_children():
             w.destroy()
 
@@ -1896,8 +2067,17 @@ class Application(tk.Tk):
                       foreground="gray").pack(anchor="w")
         elif mode == 3:
             ttk.Label(self.param_frame,
-                      text="Свип по уровням Keithley. Уровни — в окне настроек.",
-                      foreground="gray").pack(anchor="w")
+                      text="Свип по уровням Keithley с измерением спектров.\n"
+                           "Уровни — в окне Keithley.",
+                      foreground="gray", justify="left").pack(anchor="w")
+        elif mode == 4:
+            ttk.Label(self.param_frame,
+                      text="Измерение ВАХ (Keithley, без OPUS).\n"
+                           "Параметры свипа — в окне Keithley.",
+                      foreground="gray", justify="left").pack(anchor="w")
+            ttk.Button(self.param_frame, text="Измерить ВАХ",
+                       command=self.run_keithley_measurement).pack(
+                anchor="w", pady=6)
 
         show_3d = (mode == 1)
         if show_3d and not self._bottom_pane_visible:
@@ -1928,6 +2108,8 @@ class Application(tk.Tk):
             self.start_btn.config(text="Перейти")
         elif mode == 3:
             self.start_btn.config(text="Старт свипа")
+        elif mode == 4:
+            self.start_btn.config(text="Измерить ВАХ")
 
     # ------------------------------------------------------------
     def _build_txt_filename(self, pos=None, k_level=None, k_measured=None):
@@ -1935,17 +2117,17 @@ class Application(tk.Tk):
         parts = []
         if pos is not None:
             parts.append(f"pos{pos:.2f}um")
-        mode = self.keithley_mode_var.get()
+        mode = self.keithley_source_mode.get()
         if k_level is not None:
-            if mode == "current":
-                parts.append(f"I{self._fmt_num(k_level)}mA")
+            if mode == "CURR":
+                parts.append(f"I{self._fmt_num(k_level)}A")
             else:
                 parts.append(f"U{self._fmt_num(k_level)}V")
         if k_measured is not None:
-            if mode == "current":
+            if mode == "CURR":
                 parts.append(f"U{self._fmt_num(k_measured)}V")
             else:
-                parts.append(f"I{self._fmt_num(k_measured * 1000.0)}mA")
+                parts.append(f"I{self._fmt_num(k_measured)}A")
         return f"{base}_{'_'.join(parts)}.txt" if parts else f"{base}.txt"
 
     @staticmethod
@@ -2006,6 +2188,16 @@ class Application(tk.Tk):
     # ------------------------------------------------------------
     def start_measurement(self):
         mode = self.mode_var.get()
+
+        if mode == 4:
+            if self.keithley is None:
+                messagebox.showerror("Ошибка", "Keithley не подключён.")
+                return
+            self.stop_requested = False
+            self.log("=" * 30 + " СТАРТ ВАХ " + "=" * 30)
+            self.run_keithley_measurement()
+            return
+
         if mode != 2 and (self.opus is None or not self.opus.connected):
             messagebox.showerror("Ошибка", "OPUS не подключён.")
             return
@@ -2064,26 +2256,27 @@ class Application(tk.Tk):
 
     # ------------------------------------------------------------
     def _keithley_set_level(self, level):
-        """Устанавливает уровень, читает измеренное значение.
-        Возвращает (measured, compliance_status)."""
         if self.keithley is None:
             return None, None
-        mode = self.keithley_mode_var.get()
+        mode = self.keithley_source_mode.get()
         try:
-            if mode == "current":
+            if mode == "CURR":
                 self.keithley.set_source_function('CURR')
-                self.keithley.set_source_level(level * 1e-3)
+                self.keithley.set_source_level(float(level))
                 self.keithley.set_compliance(
-                    float(self.k_voltage_compliance.get()))
+                    float(self.keithley_compliance.get()))
             else:
                 self.keithley.set_source_function('VOLT')
                 self.keithley.set_source_level(float(level))
                 self.keithley.set_compliance(
-                    float(self.k_current_compliance.get()) * 1e-3)
+                    float(self.keithley_compliance.get()))
             self.keithley.output_on()
             time.sleep(0.4)
-            measured, _unit = self.keithley.read()
+            v, i = self.keithley.read_v_and_i()
+            if v is None or i is None:
+                v, i = 0.0, 0.0
             st = self.keithley.get_compliance_status()
+            measured = v if mode == "CURR" else i
             return measured, st
         except Exception as e:
             self.log(f"Keithley: ошибка установки уровня — {e}")
@@ -2172,7 +2365,7 @@ class Application(tk.Tk):
                 self.data_queue.put(("progress", (idx, total)))
                 status = f"Точка {idx}/{total}: {pos:.2f} µm"
                 if k_level is not None:
-                    status += f", {self.keithley_mode_var.get()}={k_level}"
+                    status += f", {self.keithley_source_mode.get()}={k_level}"
                 self.data_queue.put(("status", status))
 
                 try:
@@ -2253,16 +2446,16 @@ class Application(tk.Tk):
                 self.data_queue.put(("progress", (idx, total)))
                 self.data_queue.put(("status",
                                      f"Свип {idx}/{total}: "
-                                     f"{self.keithley_mode_var.get()}={lvl}"))
+                                     f"{self.keithley_source_mode.get()}={lvl}"))
 
                 k_measured, st = self._keithley_set_level(lvl)
                 if k_measured is not None:
-                    if self.keithley_mode_var.get() == "current":
-                        self.log(f"Keithley: I={lvl} мА, "
-                                 f"U={k_measured:.4f} В")
+                    if self.keithley_source_mode.get() == "CURR":
+                        self.log(f"Keithley: I={lvl} A, "
+                                 f"U={k_measured:.4f} V")
                     else:
-                        self.log(f"Keithley: U={lvl} В, "
-                                 f"I={k_measured * 1000:.4f} мА")
+                        self.log(f"Keithley: U={lvl} V, "
+                                 f"I={k_measured:.4f} A")
                 if st and st not in ("OK", "?", "--"):
                     self.log(f"Keithley status: {st}")
 
@@ -2279,7 +2472,7 @@ class Application(tk.Tk):
                 self.spectra.append({
                     'pos': 0.0, 'wn': wn.copy(),
                     'intensity': intensity.copy(),
-                    'label': f"{self.keithley_mode_var.get()}={lvl}"
+                    'label': f"{self.keithley_source_mode.get()}={lvl}"
                 })
                 self.save_spectrum_to_file(wn, intensity, pos=None,
                                            k_level=lvl, k_measured=k_measured)
@@ -2313,6 +2506,20 @@ class Application(tk.Tk):
         if pos != 0.0:
             title += f" при позиции {pos:.2f} µm"
         self.ax_spectrum.set_title(title)
+        self.ax_spectrum.grid(True, alpha=0.3)
+        self.canvas_spectrum.draw_idle()
+
+    def _plot_keithley(self, x, y, title):
+        self.ax_spectrum.clear()
+        self.ax_spectrum.plot(x, y, 'r.-', markersize=5)
+        mode = self.keithley_source_mode.get()
+        if mode == "VOLT":
+            self.ax_spectrum.set_xlabel("Напряжение, В")
+            self.ax_spectrum.set_ylabel("Ток, А")
+        else:
+            self.ax_spectrum.set_xlabel("Ток, А")
+            self.ax_spectrum.set_ylabel("Напряжение, В")
+        self.ax_spectrum.set_title(title or "Keithley 2400 — ВАХ")
         self.ax_spectrum.grid(True, alpha=0.3)
         self.canvas_spectrum.draw_idle()
 
@@ -2426,14 +2633,6 @@ class Application(tk.Tk):
             except Exception:
                 pass
             self.destroy()
-
-    # служебные алиасы для совместимости с KeithleyWindow
-    keithley_mode_var = tk.StringVar(value="current")
-    k_start = tk.DoubleVar(value=1.0)
-    k_end = tk.DoubleVar(value=10.0)
-    k_step = tk.DoubleVar(value=1.0)
-    k_voltage_compliance = tk.DoubleVar(value=20.0)
-    k_current_compliance = tk.DoubleVar(value=100.0)
 
 
 # ------------------------------------------------------------
